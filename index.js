@@ -10,21 +10,19 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const pino = require("pino");
 const express = require("express");
 
-// 1. Web Server for Render
+// 1. Render Port Binding
 const app = express();
-const PORT = process.env.PORT || 10000;
-app.get("/", (req, res) => res.send("Bot is Active"));
-app.listen(PORT, '0.0.0.0', () => console.log(`✅ Web Server started on port ${PORT}`));
+app.get("/", (req, res) => res.send("Bot Status: Ready for Pairing"));
+app.listen(process.env.PORT || 10000, '0.0.0.0');
 
-// 2. Gemini AI Config
+// 2. Config
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || "dummy_key");
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-// 3. Your Phone Number
 const myNumber = "256755190711"; 
 
 async function startBot() {
+    // Delete any old session data to start fresh (fixes corrupted files)
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     
     const sock = makeWASocket({
@@ -34,44 +32,47 @@ async function startBot() {
         },
         printQRInTerminal: false,
         logger: pino({ level: "silent" }),
-        // Identifies as a real browser
-        browser: Browsers.macOS('Chrome'),
+        // TRICK: Identifies as Windows Chrome (Very stable)
+        browser: Browsers.appropriate('Desktop'),
+        connectTimeoutMs: 120000,
+        keepAliveIntervalMs: 30000,
     });
 
-    // PAIRING CODE PROCESS
+    // Request Pairing Code
     if (!sock.authState.creds.registered) {
-        console.log(`\n⏳ Requesting pairing code for: ${myNumber}...`);
+        console.log("⏳ Waiting 15 seconds for connection to stabilize...");
         setTimeout(async () => {
             try {
                 let code = await sock.requestPairingCode(myNumber);
-                console.log("\n==============================");
-                console.log(`👉 YOUR WHATSAPP CODE IS: ${code}`);
-                console.log("==============================\n");
-                console.log("STEPS TO LINK:");
-                console.log("1. Open WhatsApp on your phone.");
-                console.log("2. Go to Settings > Linked Devices.");
-                console.log("3. Tap 'Link a Device'.");
-                console.log("4. Tap 'Link with phone number instead' at the bottom.");
-                console.log(`5. Enter the code: ${code}`);
-            } catch (e) {
-                console.log("Error requesting pairing code. Try redeploying:", e.message);
+                console.log("\n----------------------------");
+                console.log(`👉 YOUR PAIRING CODE: ${code}`);
+                console.log("----------------------------\n");
+            } catch (err) {
+                console.log("Error getting code (IP likely blocked). Retrying in 1 minute...");
             }
-        }, 10000); // Waits 10 seconds for the server to be ready
+        }, 15000);
     }
 
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect } = update;
+        
         if (connection === "close") {
             const reason = lastDisconnect?.error?.output?.statusCode;
             console.log(`Connection closed. Code: ${reason}`);
-            if (reason !== DisconnectReason.loggedOut) {
-                console.log("Reconnecting...");
-                setTimeout(() => startBot(), 10000);
+
+            // ANTI-405 LOGIC: If flagged, wait 10 MINUTES instead of 5 seconds
+            if (reason === 405 || reason === 401) {
+                console.log("🚩 405 ERROR DETECTED. WhatsApp flagged the IP. Cooling down for 10 minutes...");
+                await delay(600000); // 10 minute wait
+                startBot();
+            } else if (reason !== DisconnectReason.loggedOut) {
+                await delay(10000);
+                startBot();
             }
         } else if (connection === "open") {
-            console.log("✅ SUCCESS: Your WhatsApp is now LINKED and BOT IS LIVE!");
+            console.log("✅ SUCCESS: WhatsApp Connected!");
         }
     });
 
@@ -80,27 +81,22 @@ async function startBot() {
         if (!msg.message || msg.key.fromMe) return;
         const jid = msg.key.remoteJid;
 
-        // STATUS AUTO-VIEW & REACT
+        // Auto-View Status
         if (jid === 'status@broadcast') {
             await sock.readMessages([msg.key]);
-            const emojis = ["🔥", "👏", "🙌", "❤️"];
-            await delay(3000);
-            await sock.sendMessage(jid, { react: { text: emojis[Math.floor(Math.random()*4)], key: msg.key } }, { statusForward: true });
+            await sock.sendMessage(jid, { react: { text: "❤️", key: msg.key } }, { statusForward: true });
             return;
         }
 
-        // AI AUTO-REPLY
+        // Gemini AI Response
         const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
         if (text && !jid.endsWith('@g.us')) {
             try {
                 const result = await model.generateContent(text);
                 await sock.sendMessage(jid, { text: result.response.text() }, { quoted: msg });
-            } catch (e) { console.log("AI error: Check your API Key."); }
+            } catch (e) { console.log("AI Error"); }
         }
     });
 }
-
-// Global crash protection
-process.on('uncaughtException', (err) => console.log("Caught error:", err.message));
 
 startBot();
